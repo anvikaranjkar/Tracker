@@ -1,17 +1,13 @@
 # Show Up design notes
 
-I reviewed the product screens and demos for Hevy, Structured and HabitShare. I also read an independent analysis of interface patterns people associate with AI-generated websites. The app uses an off-white page, dark ink, cobalt actions and the structure of a sports fixture. Instrument Sans carries the interface and IBM Plex Mono identifies dates, quantities and signatures.
+The layout keeps Show Up’s paper background, cobalt controls, Instrument Sans and IBM Plex Mono. The Today screen starts with the date and the user’s check-ins. The group panel shows attendance and a small roster. The full roster lives with the agreement, where every member can review the terms and their own goal.
 
-| Screen | Observed pattern | Design decision |
-| --- | --- | --- |
-| Today | Hevy puts prior amounts next to the current input and offers a way to reuse them. | Keep the fastest log action beside its goal. Open the relevant unit, offer common amounts and optionally remember a favourite. Keep the friend’s progress beside the user’s own list on desktop. [Hevy logging screens](https://www.hevyapp.com/features/track-exercises/) |
-| Calendar | Structured groups tasks into a single timeline and offers week and month views. | Start in week view with a day agenda. Use the grid to scan dates and the agenda for titles, status, logs and editing. Tags and visible counts support scanning at narrow sizes. [Structured product demo](https://structured.app/) |
-| Match sheet | HabitShare gives friends visibility into selected habits and keeps private ones out of their view. | Show exactly what both members agree to on two sides of one sheet. Keep personal events and private notes out of the partner’s account. Use a dated stamp for each signature and make the editable draft visibly distinct. [HabitShare product screens](https://habitshareapp.com/) |
+## Mobile and installation
 
-Three defaults were removed from the design:
+The mobile header includes the inbox, the bottom navigation accounts for the home indicator and landscape content respects left and right safe areas. Form inputs use 16 px text, and information icons have 44 px touch targets. Tooltips stay open while hovered, work with keyboard focus and tap, and close with Escape. [WebKit’s safe-area guidance](https://webkit.org/blog/7929/designing-websites-for-iphone-x/) · [WCAG 2.2 hover and focus guidance](https://www.w3.org/WAI/WCAG22/Understanding/content-on-hover-or-focus.html)
 
-- Gradient text, purple glows and unrelated decoration. Cobalt marks the next action or selected state. Thin lane lines support the fixture-sheet direction. [Vibecoded Design Tells critique](https://github.com/JCarterJohnson/vibecoded-design-tells/blob/main/unslop-ai-ui/DATA_AND_GRAPHS.md)
-- A uniform grid of rounded cards. Daily goals use ruled rows, the calendar uses a true seven-day grid, and the agreement uses a two-sided match sheet.
-- A task screen dominated by marketing copy and filler badges. Today starts with the date and a single next move. Pact status, due labels and demo labels describe real states.
+The manifest uses a stable app ID, a standalone launch, standard and maskable icons, an Apple touch icon and an Inbox shortcut. Install help follows the device’s menu. Fonts are hosted with the app. The service worker precaches versioned public files, uses the network for navigation and displays a local reconnect screen if needed. Account responses are network-only. [Chrome’s PWA debugging guide](https://developer.chrome.com/docs/devtools/progressive-web-apps/) · [MDN’s offline and background operation guide](https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/Guides/Offline_and_background_operation)
 
-Controls have visible focus, text accompanies status colour, the sign action has a keyboard-accessible confirmation, and motion respects reduced-motion settings. The browser check covers overflow and automated axe checks at phone and desktop widths. The build environment prevented screenshot review. [WCAG 2.2](https://www.w3.org/TR/WCAG22/)
+## Notifications
+
+The inbox shows group invitations and open check-ins. System reminders are opt-in per device and open directly to Today. Lock-screen copy contains no goal names or notes. The message supports WebKit’s declarative format and the service worker handles delivery on other browsers. [WebKit’s push delivery guidance](https://webkit.org/blog/16535/)

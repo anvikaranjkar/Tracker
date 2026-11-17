@@ -1,54 +1,76 @@
 # Show Up
 
-A two-person accountability tracker. Each friend sets their own fitness, study or custom goals. Both sign the same match sheet, log progress and see the result at the agreed weekly checkpoint.
+Group accountability pacts for up to 50 members. Set your own goal, check in once a day and see how the group is going.
 
-## Deploy from GitHub to Vercel
+## Deploy to Vercel from GitHub
 
-1. **Create the database.** Create a [Neon Postgres project](https://console.neon.tech/). In its SQL Editor, paste the whole contents of [server/schema.sql](server/schema.sql) and click **Run**. From **Connect**, copy the pooled Postgres connection string for the same branch and database.
-2. **Upload the source to GitHub.** Extract the ZIP. Open the extracted folder and upload its contents to the root of a new GitHub repository using **Add file → Upload files**. Keep the folders intact. The GitHub root should show `package.json`, `vercel.json`, `index.html`, `api/`, `src/` and `server/`.
-3. **Import and deploy.** In Vercel, choose **Add New → Project** and import the repo. The included configuration selects **Vite**, Node.js **24.x**, and the `dist` build output. Leave the root at the repo root. Add the environment variable **`DATABASE_URL`** with the Neon connection string in **Production** before clicking **Deploy**. If you already deployed, add the variable and redeploy.
-4. **Test with a mate.** Open the production URL and create an account and pact. Add your first goal, create an invite link, and open it in a separate browser profile or on another phone. Create the second account, add its goal, then sign from both accounts. Use the production URL when sharing invites.
+1. **Apply the database schema.** In your existing Neon database, open the SQL Editor and run all of [server/schema.sql](server/schema.sql). You can rerun it safely. It backfills membership for the existing pacts and keeps their accounts, goals, check-ins and history. For a fresh install, create a Neon project first and run the same file.
+2. **Upload the source.** Extract the ZIP and upload its contents to the root of your GitHub repository with **Add file → Upload files**. The repository root should contain `package.json`, `vercel.json`, `index.html`, `api/`, `src/` and `server/`.
+3. **Deploy.** Connect the repository to the existing Vercel project to keep its URL, or import the repository into a new Vercel project. Use the repo root, the Vite preset and Node.js 24. Set **`DATABASE_URL`** in Vercel’s Production environment to the pooled connection string for the Neon database from step 1, then deploy. Keep this value in Vercel’s environment settings.
+4. **Try the group flow.** Create a pact, add your goal and sign. Open the same invite link in two other browser profiles. Each member can join, add a different goal and sign. On Today, log a check-in and reopen it with **Edit**.
 
-Enter the connection string in Vercel’s environment settings. Keep it out of GitHub and out of any variable with a `VITE_` prefix. A deployment without a database can open the read-only demo while the database is being set up. An ephemeral Vercel preview needs its own database variable if you want to use live accounts there.
+[Vercel’s GitHub guide](https://vercel.com/docs/git/vercel-for-github) · [Neon’s connection guide](https://neon.com/docs/connect/connect-from-any-app)
 
-[Vercel’s GitHub import guide](https://vercel.com/docs/git/vercel-for-github) · [Neon’s connection guide](https://neon.com/docs/connect/connect-from-any-app) · [Vercel’s Node runtime guide](https://vercel.com/docs/functions/runtimes/node-js)
+## Install it
 
-## What’s in the app
+- **iPhone or iPad.** In Safari, use **Share → Add to Home Screen**. Keep **Open as Web App** enabled when offered. Launch the app from its icon before enabling push reminders. [WebKit’s Home Screen push guide](https://webkit.org/blog/13878/web-push-for-web-apps-on-ios-and-ipados/) · [Safari’s Open as Web App behaviour](https://webkit.org/blog/17333/webkit-features-in-safari-26-0/)
+- **Mac.** In Safari, choose **File → Add to Dock**. Chrome and Edge offer installation through their address bar or app menu. [Apple’s Mac web app guide](https://support.apple.com/en-us/104996) · [Chrome’s installation guide](https://developer.chrome.com/docs/modern-web-guidance/guides/pwa/install-web-app)
+- **Android.** In Chrome, use **Add to Home screen → Install** in the browser menu or use **Install Show Up** inside the app. [Manifest and installation guidance](https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/Guides/Making_PWAs_installable)
 
-- **Today** has check-ins, quick amounts, per-goal favourites, partner progress, cheers, nudges and an in-app inbox.
-- **Calendar** has week, month and agenda views. Filter by pact and person, add personal events, view and correct logs, or export selected dates and the visible schedule as `.ics`.
-- **Pacts** has one friend slot per pact, signed versions, a two-sided match sheet, effective dates for changes and an audit trail. Each account can join multiple pacts.
-- **Checkpoints** use the signed time zone, cutoff, grace period and rule. A weekly check-in rule counts distinct days. A zero-amount log counts as a check-in but adds zero toward the outcome target. An excused day removes that day’s obligation. A weekly total uses the signed target unless the entire window is excused.
-- **Forfeits** are optional and private. A result can be flagged. Both members can vote to waive a forfeit, and the partner can confirm completion. Late logs and corrections require the other member’s approval once the entry’s grace window closes.
-- **Privacy** includes member-only pact access, personal calendar events, optional shared log notes and a separate private fitness detail field. The demo uses its own in-memory fixtures and creates zero database records.
+The app opens to Today. The service worker caches the offline screen and public app resources. Check-ins save when connected. If the connection drops during a check-in, keep the form open and retry when it returns.
 
-Accounts use a username and password. The app has no email or SMS delivery and no self-service password reset. Reminders appear in the app. Open clients refresh when focused and about every 12 seconds while visible. The API settles closed checkpoints when a member next opens or uses the pact. A short first, last or revised week uses the full signed target and tells both friends on the match sheet.
+## Optional notifications when the app is closed
+
+In-app invites and reminders are included with the core deployment. To send push reminders as well, install the project dependencies on your computer, then generate a key pair and a cron secret once.
+
+```sh
+npm ci
+npx --no-install web-push generate-vapid-keys
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+```
+
+Set these in Vercel’s **Production** environment, then redeploy.
+
+| Variable | Value |
+| --- | --- |
+| `VAPID_SUBJECT` | A real contact URI such as `mailto:you@example.com` with your actual address |
+| `VAPID_PUBLIC_KEY` | The generated public key |
+| `VAPID_PRIVATE_KEY` | The generated private key |
+| `CRON_SECRET` | The generated random hex string |
+
+After deploying, each member can use **Account settings → Push reminders → Turn on push reminders** on each device they want to notify. Keep the original key pair for future deploys. Vercel sends the cron secret to the included reminder job automatically. [Web Push key guide](https://github.com/web-push-libs/web-push#generatevapidkeys) · [Vercel cron authentication](https://vercel.com/docs/schedules/cron-jobs/manage-cron-jobs#securing-cron-jobs)
+
+The included job runs once daily during the **08:00 UTC hour**. In Sydney that’s the 6 pm hour on standard time or 7 pm on daylight saving time. Vercel Hobby can run it anywhere in that hour. A device gets a reminder only if the account has a check-in still open and unlogged when the job runs. Change the UTC schedule in `vercel.json` if your group uses a different evening window. [Vercel Hobby cron timing](https://vercel.com/docs/schedules/cron-jobs/usage-and-pricing#hobby-scheduling-limits)
+
+## How pacts work
+
+- The organiser can share a reusable link or send an inbox invite to a Show Up username. Invite links last seven days and can be copied again, replaced or revoked.
+- The organiser publishes the terms by signing. Members set their own goal and sign independently. A member who signs after the start date begins on the day they sign, or the next day if the cutoff has passed. For revisions, members who already signed the current agreement must sign the new one.
+- New pacts have one check-in per member per day. A zero-progress check-in still records attendance. Members can choose a daily target or a target that totals across the week. Existing signed pacts retain their original schedules and scoring.
+- The organiser writes a forfeit or randomises one and edits it before publishing. Checkpoints use the signed time zone, deadline, grace period and rule. Short weeks use the full weekly target. Another signed member can review late check-ins and agree to waive a forfeit.
+- The calendar supports individual and group filters, private events and calendar export. Check-in notes are private unless their author shares them. Private fitness details are visible only to the author.
 
 ## Run locally
 
-Use Node.js 24. The app starts with a local Postgres-compatible database in `.local-db/` when `DATABASE_URL` is absent. You can create two accounts in separate browser profiles.
+Use Node.js 24. With no `DATABASE_URL`, the app uses a local PostgreSQL-compatible database. Set `SHOWUP_MEMORY=1` for a disposable test database.
 
 ```sh
 npm ci
 npm run dev
-```
-
-Open the local URL printed in the terminal. Set `SHOWUP_MEMORY=1` before `npm run dev` for disposable sessions. To use a hosted database locally, put its connection string in `.env.local`, then run `npm run db:setup` once.
-
-## Verification
-
-```sh
-npm run build
 npm test
 ```
 
-The delivered build and automated API tests passed. The tests use a real local PostgreSQL engine and separate authenticated sessions. They exercise invite expiry, revocation and repeat redemption, outsider access, both signatures, edited draft invalidation, future versions, private notes and calendar events, idempotent writes, partner permissions, partial progress, rest days, excused days, DST, a midnight grace period, a triggered forfeit and an approved correction.
-
-The hosted Vercel and Neon path has a smoke test in step 4 above. This handoff did not run a live cloud deployment or a physical two-phone test. Local browser launch and preview were blocked in the build environment. A runnable browser check is included to test app interactions, two browser profiles, offline retry, calendar export, responsive screenshots and automated accessibility checks. With the disposable local server running in one terminal, run:
+Use the production preview for the install and offline checks. Run the following in one terminal.
 
 ```sh
-npx playwright install chromium
-npm run test:browser
+npm run build
+SHOWUP_MEMORY=1 npm run preview
 ```
 
-Screenshots are saved under `test-results/` for visual review. [DESIGN.md](DESIGN.md) records the design references and decisions.
+Then run the browser tests in another terminal. Browser screenshots and accessibility checks are saved under `test-results/`.
+
+```sh
+npx --no-install playwright install chromium webkit
+SHOWUP_EXPECT_PWA=1 npm run test:browser
+SHOWUP_BROWSER=webkit SHOWUP_EXPECT_PWA=1 npm run test:browser
+```

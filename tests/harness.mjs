@@ -25,5 +25,5 @@ export async function harness(clock, { secure = false } = {}) {
       return result;
     };
   }
-  return { db, request, session, close: () => store.close() };
+  return { db, request, session, exec: statement => store.exec(statement), close: () => store.close() };
 }

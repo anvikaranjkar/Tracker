@@ -5,15 +5,15 @@ import { periodEnd } from '../shared/scoring.mjs';
 import { downloadCalendar, entriesFor, isCheckpoint, monthStart, moveMonth, pactName, pactZone } from './model.mjs';
 import { scheduledEvent } from './model.mjs';
 import { Button, Empty, IconButton, PageTitle, SectionTitle } from './ui.jsx';
-import { GoalRow } from './Today.jsx';
+import { CheckInButton, GoalRow } from './Today.jsx';
 
 function eventsFor(pacts, all, person, day, now, user) {
-  const allowed = entry => person === 'both' || (entry.goal.owner === user.id) === (person === 'me');
+  const allowed = entry => !person || entry.goal.owner === person;
   const entries = entriesFor(pacts, day, now).filter(allowed).filter(entry => entry.goal.cadence !== 'deadline' || entry.goal.due === day
     || entry.pact.logs.some(log => !log.deleted && log.day === day && log.goal === entry.goal.id && log.version === entry.version.number));
   const planned = entries.filter(entry => entry.progress.state === 'Excused' || scheduledEvent(entry)
     || entry.pact.logs.some(log => !log.deleted && log.day === day && log.goal === entry.goal.id && log.version === entry.version.number));
-  const own = person !== 'friend' && all ? user.events.filter(event => event.day === day) : [];
+  const own = (!person || person === user.id) && all ? user.events.filter(event => event.day === day) : [];
   const milestones = pacts.filter(pact => isCheckpoint(pact, day)).map(pact => {
     const ending = pact.versions.some(version => periodEnd(pact, version) === day);
     return { pact, title: ending ? 'Version ends · checkpoint' : 'Weekly checkpoint' };
@@ -23,9 +23,11 @@ function eventsFor(pacts, all, person, day, now, user) {
 export default function Calendar({ user, pacts, now, day, setDay, demo, log, personEvent, removeEvent }) {
   const [view, setView] = useState('Week');
   const [filter, setFilter] = useState('');
-  const [person, setPerson] = useState('both');
+  const [person, setPerson] = useState('');
   const today = localDay(now, user.settings.zone);
   const selectedPacts = filter ? pacts.filter(pact => pact.id === filter) : pacts;
+  const people = [...new Map(selectedPacts.flatMap(pact => pact.members.map(member => [member.id, member]))).values()]
+    .filter(member => member.id !== user.id).sort((a, b) => a.name.localeCompare(b.name));
   const first = view === 'Month' ? startWeek(monthStart(day)) : view === 'Week' ? startWeek(day) : day;
   const count = view === 'Month' ? 42 : view === 'Week' ? 7 : 14;
   const range = dayRange(first, addDays(first, count - 1));
@@ -47,8 +49,9 @@ export default function Calendar({ user, pacts, now, day, setDay, demo, log, per
     </PageTitle>
     <div className="calendar-filters">
       <div className="segmented" aria-label="Calendar view">{['Week', 'Month', 'Agenda'].map(mode => <button key={mode} aria-pressed={view === mode} onClick={() => setView(mode)}>{mode}</button>)}</div>
-      <label><span className="sr-only">Filter by pact</span><select value={filter} onChange={e => setFilter(e.target.value)}><option value="">All pacts</option>{pacts.map(pact => <option key={pact.id} value={pact.id}>{pactName(pact)}</option>)}</select></label>
-      <label><span className="sr-only">Filter by person</span><select value={person} onChange={e => setPerson(e.target.value)}><option value="both">Both</option><option value="me">Me</option><option value="friend">Friend</option></select></label>
+      <label><span className="sr-only">Filter by pact</span><select value={filter} onChange={e => { setFilter(e.target.value); setPerson(''); }}><option value="">All pacts</option>{pacts.map(pact => <option key={pact.id} value={pact.id}>{pactName(pact)}</option>)}</select></label>
+      <label><span className="sr-only">Filter by person</span><select value={person} onChange={e => setPerson(e.target.value)}><option value="">Everyone</option>
+        <option value={user.id}>Me</option>{people.map(member => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>
     </div>
     <div className={'calendar-layout ' + (view === 'Agenda' ? ' agenda-layout' : '')}>
       <section className="calendar-surface" aria-label={view + ' calendar'}>
@@ -83,12 +86,12 @@ export default function Calendar({ user, pacts, now, day, setDay, demo, log, per
             {labelDay(date, { weekday: 'long', day: 'numeric', month: 'short' })}
           </SectionTitle>
           {info.entries.map(entry => <div className="agenda-entry" key={entry.pact.id + entry.goal.id}>
-            <GoalRow entry={entry} compact sub={(entry.goal.owner === user.id ? 'You' : entry.pact.members.find(member => member.id === entry.goal.owner)?.name.split(' ')[0]) + ' · ' + pactName(entry.pact)}
+            <GoalRow entry={entry} compact sub={(entry.goal.owner === user.id ? 'You' : entry.pact.members.find(member => member.id === entry.goal.owner)?.name ?? 'Member') + ' · ' + pactName(entry.pact)}
               action={!demo && !entry.pact.endedOn && entry.goal.owner === user.id && entry.progress.window && entry.progress.state !== 'Excused' && date <= localDay(now, pactZone(entry.pact))
-                ? <Button kind="outline" onClick={() => log(entry)}>{entry.progress.state === 'Missed' ? 'Review' : 'Log'}</Button> : null} />
+                ? <CheckInButton entry={entry} log={log} /> : null} />
             {(entry.pact.logs.filter(item => item.goal === entry.goal.id && item.day === date && item.version === entry.version.number && !item.deleted)).map(item => <div className="agenda-log" key={item.id}>
               <span>{item.amount} {entry.goal.unit === 'completion' ? 'completion' : entry.goal.unit}{item.late ? ' · late' : ''}{item.note ? ' · ' + item.note : ''}{item.privateDetail ? ' · Private detail: ' + item.privateDetail : ''}</span>
-              {!demo && !entry.pact.endedOn && item.owner === user.id && <button className="text-button" onClick={() => log(entry, item)}>Edit</button>}
+              {!demo && !entry.pact.endedOn && !entry.pact.dailyCheckIns && item.owner === user.id && <button className="text-button" onClick={() => log(entry, item)}>Edit</button>}
             </div>)}
           </div>)}
           {info.own.map(event => <div className="calendar-event" key={event.id}><CalendarDays size={20} /><div><strong>{event.title}</strong><small>{[event.time && labelClock(event.time), 'Private', event.note].filter(Boolean).join(' · ')}</small></div>{!demo && <IconButton title={'Remove ' + event.title} onClick={() => removeEvent(event)}><Trash2 size={16} /></IconButton>}</div>)}

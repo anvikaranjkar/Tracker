@@ -29,5 +29,34 @@ CREATE TABLE IF NOT EXISTS showup_pacts (
   CHECK (owner_id <> friend_id)
 );
 CREATE INDEX IF NOT EXISTS showup_pacts_owner ON showup_pacts(owner_id);
-CREATE INDEX IF NOT EXISTS showup_pacts_friend ON showup_pacts(friend_id);
+ALTER TABLE showup_pacts ADD COLUMN IF NOT EXISTS invite_token text;
+
+CREATE TABLE IF NOT EXISTS showup_pact_members (
+  pact_id uuid NOT NULL REFERENCES showup_pacts(id) ON DELETE CASCADE,
+  account_id uuid NOT NULL REFERENCES showup_accounts(id) ON DELETE CASCADE,
+  PRIMARY KEY (pact_id, account_id)
+);
+CREATE INDEX IF NOT EXISTS showup_pact_members_account ON showup_pact_members(account_id, pact_id);
+INSERT INTO showup_pact_members(pact_id, account_id)
+  SELECT id, owner_id FROM showup_pacts
+  UNION ALL SELECT id, friend_id FROM showup_pacts WHERE friend_id IS NOT NULL
+  ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS showup_pact_invites (
+  pact_id uuid NOT NULL REFERENCES showup_pacts(id) ON DELETE CASCADE,
+  account_id uuid NOT NULL REFERENCES showup_accounts(id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL,
+  expires_at timestamptz NOT NULL,
+  PRIMARY KEY(pact_id, account_id)
+);
+CREATE INDEX IF NOT EXISTS showup_pact_invites_account ON showup_pact_invites(account_id, expires_at);
+
+CREATE TABLE IF NOT EXISTS showup_push_subscriptions (
+  endpoint text PRIMARY KEY,
+  account_id uuid NOT NULL REFERENCES showup_accounts(id) ON DELETE CASCADE,
+  subscription jsonb NOT NULL,
+  last_reminder date,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS showup_push_account ON showup_push_subscriptions(account_id);
 COMMIT;

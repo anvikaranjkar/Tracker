@@ -1,6 +1,8 @@
 import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
-import { AppError, applyAction, clean, newPact, requireThat, settle, validDay, validId, visiblePact } from './pacts.mjs';
+import { localDay } from '../shared/time.mjs';
+import { AppError, addMember, applyAction, clean, GROUP_LIMIT, newPact, requireThat, settle, validDay, validId, visiblePact } from './pacts.mjs';
+import { pushAction } from './push.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(32).toString('base64url');
@@ -9,7 +11,7 @@ const sessionSeconds = 30 * 24 * 60 * 60;
 const inviteMs = 7 * 86400000;
 const clocks = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const tokenPattern = /^[A-Za-z0-9_-]{43}$/;
-const settingsDefault = { mute: false, quiet: false, quietStart: '22:00', quietEnd: '07:00', zone: 'Australia/Sydney' };
+const settingsDefault = { zone: 'Australia/Sydney' };
 function accountZone(value) {
   try {
     const zone = clean(value, 80);
@@ -64,7 +66,7 @@ async function authenticate(db, req, res, name, secure, data, now) {
   requireThat(typeof data.handle === 'string' && data.handle.trim().length <= 24 && /^[a-z0-9_]{3,24}$/.test(handle),
     'Use 3–24 letters, numbers or underscores for your username.');
   requireThat(password.length >= 10 && password.length <= 128, 'Use a password between 10 and 128 characters.');
-  requireThat(!signup || display.length >= 2, 'Enter the name your friend will see.');
+  requireThat(!signup || display.length >= 2, 'Enter the name your group will see.');
   const source = String(req.headers['x-vercel-forwarded-for'] || req.socket?.remoteAddress || 'local').split(',')[0].slice(0, 120);
   await authLimit(db, 'ip:' + source, now, signup ? 18 : 45);
   await authLimit(db, 'handle:' + handle, now, 18);
@@ -104,10 +106,9 @@ async function updateProfile(db, account, data, now) {
     const row = await one(client, 'SELECT id,handle,profile FROM showup_accounts WHERE id=$1 FOR UPDATE', [account.id]);
     const p = row.profile;
     if (data.action === 'settings') {
-      const { zone, quietStart, quietEnd } = data.settings ?? {};
-      requireThat(typeof zone === 'string' && zone.length <= 80 && clocks.test(quietStart) && clocks.test(quietEnd), 'Check the quiet hours and time zone.');
+      const zone = clean(data.settings?.zone, 80);
       try { new Intl.DateTimeFormat('en', { timeZone: zone }); } catch { throw new AppError(400, 'Choose a valid time zone.'); }
-      p.settings = { zone, quietStart, quietEnd, mute: Boolean(data.settings.mute), quiet: Boolean(data.settings.quiet) };
+      p.settings = { zone };
     } else if (data.action === 'inboxRead') {
       p.inboxSince = now;
     } else if (data.action === 'favourite') {
@@ -133,11 +134,12 @@ async function updateProfile(db, account, data, now) {
 }
 async function updatePact(client, row, now) {
   row.document.serial = (row.document.serial || 0) + 1;
-  await client.query(`UPDATE showup_pacts SET friend_id=$1,invite_hash=$2,invite_expires_at=$3,document=$4::text::jsonb,edited_at=$5 WHERE id=$6`,
-    [row.friend_id, row.invite_hash, row.invite_expires_at, JSON.stringify(row.document), iso(now), row.id]);
+  await client.query(`UPDATE showup_pacts SET invite_token=$1,invite_hash=$2,invite_expires_at=$3,document=$4::text::jsonb,edited_at=$5 WHERE id=$6`,
+    [row.invite_token ?? null, row.invite_hash, row.invite_expires_at, JSON.stringify(row.document), iso(now), row.id]);
 }
 async function pactList(db, id, now) {
-  const { rows } = await db.query('SELECT * FROM showup_pacts WHERE owner_id=$1 OR friend_id=$1 ORDER BY edited_at DESC', [id]);
+  const { rows } = await db.query(`SELECT p.* FROM showup_pacts p JOIN showup_pact_members m ON m.pact_id=p.id
+    WHERE m.account_id=$1 ORDER BY p.edited_at DESC`, [id]);
   return Promise.all(rows.map(async row => {
     if (!settle(row.document, now)) return visiblePact(row, id);
     return db.transaction(async client => {
@@ -148,74 +150,132 @@ async function pactList(db, id, now) {
   }));
 }
 
+function openForJoining(pact, now) {
+  const terms = (pact.draft ?? pact.versions.at(-1))?.terms;
+  return !pact.endedOn && terms && localDay(now, terms.zone) <= terms.end;
+}
+async function checkPactLimit(client, user) {
+  await client.query('SELECT id FROM showup_accounts WHERE id=$1 FOR NO KEY UPDATE', [user]);
+  const { count } = await one(client, 'SELECT count(*)::int AS count FROM showup_pact_members WHERE account_id=$1', [user]);
+  requireThat(count < 50, 'This account has reached its 50-pact limit.', 409);
+}
+async function pendingInvites(db, user, now) {
+  const { rows } = await db.query(`SELECT i.pact_id AS id, i.created_at, i.expires_at, p.document
+    FROM showup_pact_invites i JOIN showup_pacts p ON p.id=i.pact_id
+    WHERE i.account_id=$1 AND i.expires_at>$2
+    ORDER BY i.created_at DESC LIMIT 100`, [user, iso(now)]);
+  return rows.filter(row => openForJoining(row.document, now)).map(({ id, created_at, expires_at, document }) => ({
+    id, at: +new Date(created_at), expires: +new Date(expires_at),
+    name: (document.draft ?? document.versions.at(-1)).terms.name, from: document.members[0].name
+  }));
+}
+async function join(db, user, name, data, now) {
+  const viaLink = data.token !== undefined;
+  requireThat(viaLink ? typeof data.token === 'string' && tokenPattern.test(data.token) : validId(data.pactId), 'This invitation is invalid.', 404);
+  return db.transaction(async client => {
+    // Serialize joins by account and by pact so both capacity limits hold on simultaneous requests.
+    await client.query('SELECT id FROM showup_accounts WHERE id=$1 FOR NO KEY UPDATE', [user]);
+    const row = viaLink
+      ? await one(client, 'SELECT * FROM showup_pacts WHERE invite_hash=$1 AND invite_expires_at>$2 FOR UPDATE', [hash(data.token), iso(now)])
+      : await one(client, 'SELECT * FROM showup_pacts WHERE id=$1 FOR UPDATE', [data.pactId]);
+    const expired = 'This invitation has expired or was replaced. Ask the organiser for a fresh invite.';
+    requireThat(row, expired, 404);
+    if (row.document.members.some(member => member.id === user)) return { pact: visiblePact(row, user) };
+    requireThat(openForJoining(row.document, now), 'This pact has closed to new members.', 409);
+    if (!viaLink) {
+      const direct = await one(client, 'SELECT 1 FROM showup_pact_invites WHERE pact_id=$1 AND account_id=$2 AND expires_at>$3 FOR UPDATE',
+        [row.id, user, iso(now)]);
+      requireThat(direct, expired, 404);
+    }
+    await checkPactLimit(client, user);
+    addMember(row.document, user, name, now);
+    await client.query('INSERT INTO showup_pact_members(pact_id,account_id) VALUES($1,$2)', [row.id, user]);
+    await client.query('DELETE FROM showup_pact_invites WHERE pact_id=$1 AND account_id=$2', [row.id, user]);
+    await updatePact(client, row, now);
+    return { pact: visiblePact(row, user) };
+  });
+}
+async function inviteAction(client, row, user, data, now) {
+  requireThat(user === row.owner_id, 'Only the organiser can manage invitations.', 403);
+  if (data.action === 'inviteLink') {
+    return { inviteToken: +new Date(row.invite_expires_at) > now ? row.invite_token : null };
+  }
+  if (data.action === 'revoke') {
+    row.invite_token = row.invite_hash = row.invite_expires_at = null;
+    await updatePact(client, row, now);
+    return { pact: visiblePact(row, user) };
+  }
+  requireThat(openForJoining(row.document, now) && row.document.members.length < GROUP_LIMIT, 'This pact is closed to new invitations.', 409);
+  if (data.action === 'inviteAccount') {
+    const handle = clean(data.handle, 24).toLowerCase();
+    const target = await one(client, 'SELECT id FROM showup_accounts WHERE handle=$1', [handle]);
+    requireThat(target, 'No account found with that username.', 404);
+    requireThat(!row.document.members.some(member => member.id === target.id), 'That account is already in the pact.', 409);
+    await authLimit(client, 'invites:' + user, now, 60);
+    await client.query(`INSERT INTO showup_pact_invites(pact_id,account_id,created_at,expires_at) VALUES($1,$2,$3,$4)
+      ON CONFLICT(pact_id,account_id) DO UPDATE SET created_at=excluded.created_at, expires_at=excluded.expires_at`,
+    [row.id, target.id, iso(now), iso(now + inviteMs)]);
+    return {};
+  }
+  row.invite_token = token();
+  row.invite_hash = hash(row.invite_token);
+  row.invite_expires_at = iso(now + inviteMs);
+  await updatePact(client, row, now);
+  return { pact: visiblePact(row, user), inviteToken: row.invite_token };
+}
+
 async function run(db, req, res, data, now, cookieName, secure) {
   const action = data.action;
   if (['signup', 'login'].includes(action)) return authenticate(db, req, res, cookieName, secure, data, now);
   if (action === 'invitePreview') {
     requireThat(typeof data.token === 'string' && tokenPattern.test(data.token), 'This invitation link is invalid.', 404);
-    const row = await one(db, 'SELECT document,friend_id,invite_expires_at FROM showup_pacts WHERE invite_hash=$1', [hash(data.token)]);
-    requireThat(row && !row.document.endedOn && +new Date(row.invite_expires_at) > now, 'This link has expired or was replaced. Ask your friend for a fresh link.', 404);
-    requireThat(!row.friend_id, 'This invitation has already been used. Sign in to see your pacts.', 409);
-    return { invite: { name: row.document.draft.terms.name, from: row.document.members[0].name, expires: +new Date(row.invite_expires_at) } };
+    const row = await one(db, 'SELECT document,invite_expires_at FROM showup_pacts WHERE invite_hash=$1', [hash(data.token)]);
+    requireThat(row && openForJoining(row.document, now) && +new Date(row.invite_expires_at) > now, 'This link has expired or was replaced. Ask the organiser for a fresh link.', 404);
+    return { invite: { name: (row.document.draft ?? row.document.versions.at(-1)).terms.name, from: row.document.members[0].name, expires: +new Date(row.invite_expires_at) } };
   }
   const account = await session(db, req, cookieName, now);
   if (action === 'session') return { user: account ? userView(account) : null };
   requireThat(account, 'Sign in to continue.', 401);
   const user = account.id;
   if (action === 'logout') {
-    await db.query('DELETE FROM showup_sessions WHERE token_hash=$1', [hash(readCookie(req, cookieName))]);
+    await db.transaction(async client => {
+      if (typeof data.endpoint === 'string') await client.query('DELETE FROM showup_push_subscriptions WHERE account_id=$1 AND endpoint=$2', [user, data.endpoint]);
+      await client.query('DELETE FROM showup_sessions WHERE token_hash=$1', [hash(readCookie(req, cookieName))]);
+    });
     writeCookie(res, cookieName, '', secure, 0);
     return {};
   }
-  if (action === 'sync') return { user: userView(account), pacts: await pactList(db, user, now), now };
+  if (action === 'sync') {
+    const [pacts, invites] = await Promise.all([pactList(db, user, now), pendingInvites(db, user, now)]);
+    return { user: userView(account), pacts, invites, now };
+  }
+  if (['pushStatus', 'pushEnable', 'pushDisable'].includes(action)) return pushAction(db, user, data);
   if (['settings', 'event', 'removeEvent', 'inboxRead', 'favourite'].includes(action)) return updateProfile(db, account, data, now);
   if (action === 'create') {
     const pact = newPact(user, account.profile.name, data.terms || {}, now);
     await db.transaction(async client => {
-      await client.query('SELECT id FROM showup_accounts WHERE id=$1 FOR UPDATE', [user]);
-      const { count } = await one(client, 'SELECT count(*)::int AS count FROM showup_pacts WHERE owner_id=$1 OR friend_id=$1', [user]);
-      requireThat(count < 50, 'This account has reached its pact limit.');
+      await checkPactLimit(client, user);
       await client.query('INSERT INTO showup_pacts(id,owner_id,document,edited_at) VALUES($1,$2,$3::text::jsonb,$4)', [pact.id, user, JSON.stringify(pact), iso(now)]);
+      await client.query('INSERT INTO showup_pact_members(pact_id,account_id) VALUES($1,$2)', [pact.id, user]);
     });
     return { pact: visiblePact({ document: pact }, user) };
   }
-  if (action === 'join') {
-    requireThat(typeof data.token === 'string' && tokenPattern.test(data.token), 'This invitation link is invalid.', 404);
-    return db.transaction(async client => {
-      await client.query('SELECT id FROM showup_accounts WHERE id=$1 FOR UPDATE', [user]);
-      const row = await one(client, 'SELECT * FROM showup_pacts WHERE invite_hash=$1 FOR UPDATE', [hash(data.token)]);
-      requireThat(row && !row.document.endedOn && +new Date(row.invite_expires_at) > now, 'This link has expired or was replaced. Ask for a fresh link.', 404);
-      requireThat(user !== row.owner_id, 'This is your invitation. Open it under a different account to join.', 409);
-      if (row.friend_id === user) return { pact: visiblePact(row, user) };
-      requireThat(!row.friend_id, 'Another friend has already joined this pact.', 409);
-      const { count } = await one(client, 'SELECT count(*)::int AS count FROM showup_pacts WHERE owner_id=$1 OR friend_id=$1', [user]);
-      requireThat(count < 50, 'This account has reached its pact limit.');
-      row.friend_id = user;
-      row.document.members.push({ id: user, name: account.profile.name });
-      row.document.history.push({ id: randomUUID(), at: now, user, type: 'join', description: account.profile.name + ' joined the pact.' });
-      await updatePact(client, row, now);
-      return { pact: visiblePact(row, user) };
-    });
-  }
+  if (action === 'join') return join(db, user, account.profile.name, data, now);
   requireThat(validId(data.pactId), 'Choose a pact.');
+  if (action === 'declineInvite') {
+    await db.query('DELETE FROM showup_pact_invites WHERE pact_id=$1 AND account_id=$2', [data.pactId, user]);
+    return {};
+  }
   return db.transaction(async client => {
-    const row = await one(client, 'SELECT * FROM showup_pacts WHERE id=$1 AND (owner_id=$2 OR friend_id=$2) FOR UPDATE', [data.pactId, user]);
+    const row = await one(client, `SELECT p.* FROM showup_pacts p JOIN showup_pact_members m ON m.pact_id=p.id
+      WHERE p.id=$1 AND m.account_id=$2 FOR UPDATE OF p`, [data.pactId, user]);
     requireThat(row, 'This pact is unavailable.', 404);
-    if (['invite', 'revoke'].includes(action)) {
-      requireThat(user === row.owner_id && !row.friend_id && !row.document.endedOn, 'Only the creator can invite a friend to this open slot.', 403);
-      const raw = action === 'invite' ? token() : null;
-      row.invite_hash = raw ? hash(raw) : null;
-      row.invite_expires_at = raw ? iso(now + inviteMs) : null;
-      await updatePact(client, row, now);
-      return { pact: visiblePact(row, user), inviteToken: raw };
-    }
+    if (['invite', 'inviteLink', 'inviteAccount', 'revoke'].includes(action)) return inviteAction(client, row, user, data, now);
     settle(row.document, now);
-    const friend = row.document.members.find(member => member.id !== user);
-    const friendRow = action === 'nudge' && friend ? await one(client, 'SELECT profile FROM showup_accounts WHERE id=$1', [friend.id]) : null;
-    applyAction(row.document, user, data, now, friendRow?.profile.settings);
-    if (action === 'leave') {
-      row.invite_hash = null;
-      row.invite_expires_at = null;
+    applyAction(row.document, user, data, now);
+    if (action === 'endPact') {
+      row.invite_token = row.invite_hash = row.invite_expires_at = null;
+      await client.query('DELETE FROM showup_pact_invites WHERE pact_id=$1', [row.id]);
     }
     await updatePact(client, row, now);
     return { pact: visiblePact(row, user) };
@@ -246,7 +306,7 @@ export function makeHandler(db, { secure = true, clock = Date.now } = {}) {
     } catch (error) {
       if (error instanceof AppError) return respond(error.status, { error: error.message });
       if (error instanceof SyntaxError) return respond(400, { error: 'Invalid request data.' });
-      if (error.code === '42P01') return respond(503, { error: 'Run server/schema.sql in your database, then retry.' });
+      if (['42P01', '42703'].includes(error.code)) return respond(503, { error: 'Run the updated server/schema.sql in your database, then retry.' });
       console.error('Show Up server error:', error.code || error.name);
       return respond(500, { error: 'The server couldn’t save or load this. Try again in a moment.' });
     }

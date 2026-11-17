@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { addDays, daysBetween, localClock, localDay, startWeek, wallTime } from '../shared/time.mjs';
-import { checkpoints, isExcused, periodEnd, resultsAt, versionAt, windowFor } from '../shared/scoring.mjs';
+import { addDays, daysBetween, later, localDay, startWeek, wallTime } from '../shared/time.mjs';
+import { checkinCutoff, checkpoints, isExcused, periodEnd, resultsAt, versionAt, windowFor } from '../shared/scoring.mjs';
+
+export const GROUP_LIMIT = 50;
 
 export class AppError extends Error {
   constructor(status, message) {
@@ -15,14 +17,13 @@ export const clean = (value, limit) => typeof value === 'string' ? value.trim().
 export const validId = value => typeof value === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value);
 export const validDay = day => typeof day === 'string' && /^20\d\d-\d\d-\d\d$/.test(day)
   && Number.isFinite(Date.parse(day + 'T00:00Z')) && new Date(day + 'T00:00Z').toISOString().slice(0, 10) === day;
-const harmfulForfeit = /\b(?:pay|payment|money|cash|venmo|paypal|fine|buy|skip meals?|skip breakfast|fasting|starve|weigh(?:-?in| yourself)|lose weight|gain weight|calories?|push[ -]?ups?|burpees?|public humiliation|post an embarrassing)\b|[$£€]\s*\d/i;
 const validClock = value => typeof value === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
 function validZone(zone) {
   if (typeof zone !== 'string' || zone.length > 80) return false;
   try { new Intl.DateTimeFormat('en-AU', { timeZone: zone }); return true; } catch { return false; }
 }
 
-export function termsFrom(input) {
+export function termsFrom(input, dailyCheckIns) {
   const terms = {
     name: clean(input.name, 60),
     start: input.start,
@@ -42,12 +43,12 @@ export function termsFrom(input) {
   requireThat([0, 30, 60, 120, 720, 1440].includes(terms.grace), 'Pick one of the available grace periods.');
   requireThat(['target', 'checkins'].includes(terms.rule) && Number.isInteger(terms.missLimit)
     && terms.missLimit >= 1 && terms.missLimit <= 7, 'Choose a checkpoint rule.');
-  requireThat(!harmfulForfeit.test(terms.forfeit), 'Choose a private, harmless forfeit, such as making a playlist.');
+  requireThat(!dailyCheckIns || terms.forfeit, 'Write or randomise a forfeit.');
   requireThat(Number.isInteger(terms.forfeitDays) && terms.forfeitDays >= 1 && terms.forfeitDays <= 30, 'Choose between 1 and 30 days to finish the forfeit.');
   return terms;
 }
 
-function goalFrom(input, previous, owner, terms) {
+function goalFrom(input, previous, owner, terms, dailyCheckIns) {
   const category = input.category;
   const unit = clean(input.unit, 20);
   const target = unit === 'completion' ? 1 : Number(input.target);
@@ -58,11 +59,12 @@ function goalFrom(input, previous, owner, terms) {
     days: Array.isArray(input.days) ? [...new Set(input.days.filter(day => Number.isInteger(day) && day >= 0 && day <= 6))].sort() : [],
     due: input.cadence === 'deadline' ? input.due : null,
     dueTime: input.cadence === 'deadline' ? input.dueTime : null,
-    dailyCheck: input.cadence === 'weekly' && Boolean(input.dailyCheck), counts: Boolean(input.counts)
+    dailyCheck: input.cadence === 'weekly' && (dailyCheckIns || Boolean(input.dailyCheck)), counts: dailyCheckIns || Boolean(input.counts)
   };
   requireThat(['Fitness', 'Study', 'Custom'].includes(category) && goal.focus && goal.name.length >= 2, 'Add a focus and a goal name.');
   requireThat(unit && Number.isFinite(target) && target > 0 && target <= 100000 && Math.abs(target * 100 - Math.round(target * 100)) < 0.000001, 'Enter a target with at most two decimal places.');
   requireThat(['daily', 'scheduled', 'weekly', 'deadline'].includes(goal.cadence), 'Choose a goal schedule.');
+  requireThat(!dailyCheckIns || ['daily', 'weekly'].includes(goal.cadence), 'Choose a daily or weekly target. You’ll check in each day.');
   requireThat(goal.cadence !== 'scheduled' || goal.days.length, 'Pick at least one scheduled day.');
   requireThat(goal.cadence !== 'deadline' || (validDay(goal.due) && goal.due >= terms.start && goal.due <= terms.end && validClock(goal.dueTime)), 'Choose a deadline within the pact dates.');
   return goal;
@@ -71,20 +73,73 @@ function goalFrom(input, previous, owner, terms) {
 function audit(pact, type, user, now, description) {
   pact.history.push({ id: randomUUID(), type, user, at: now, description });
 }
-function reviseDraft(pact, owner, now, description) {
+function reviseDraft(pact, owner, now, description, changedTerms = false) {
   pact.draft.revision += 1;
-  pact.draft.signatures = {};
+  if (changedTerms) pact.draft.signatures = {};
+  else delete pact.draft.signatures[owner];
   pact.draft.change = description;
   audit(pact, 'draft', owner, now, description);
 }
 export function newPact(owner, name, input, now) {
-  const terms = termsFrom(input);
+  const terms = termsFrom(input, true);
   requireThat(terms.start >= localDay(now, terms.zone), 'Choose today or a future start date.');
   return {
-    id: randomUUID(), serial: 0, owner, members: [{ id: owner, name }],
+    id: randomUUID(), serial: 0, owner, dailyCheckIns: true, members: [{ id: owner, name }],
     draft: { number: 1, revision: 1, terms, goals: [], signatures: {}, change: 'Pact created.' },
-    versions: [], logs: [], requests: [], outcomes: [], signals: [], history: [], endedOn: null, endedAt: null
+    versions: [], pendingGoals: [], logs: [], requests: [], outcomes: [], history: [], endedOn: null, endedAt: null
   };
+}
+
+function changeGoal(pact, goals, terms, user, data) {
+  const old = goals.find(goal => goal.id === data.goal?.id);
+  requireThat(!data.goal?.id || (old && old.owner === user), 'Only the owner can change this goal.', 403);
+  if (data.action === 'deleteGoal') {
+    requireThat(old, 'That goal is unavailable.', 404);
+    return { goals: goals.filter(goal => goal !== old), description: 'Removed ' + old.name + '.' };
+  }
+  const limit = pact.dailyCheckIns ? 1 : 12;
+  requireThat(old || goals.filter(goal => goal.owner === user).length < limit,
+    pact.dailyCheckIns ? 'Edit your existing goal to change it.' : 'Each member can have up to 12 goals per version.');
+  const goal = goalFrom(data.goal || {}, old, user, terms, pact.dailyCheckIns);
+  if (old && JSON.stringify(old) === JSON.stringify(goal)) return null;
+  return { goals: [...goals.filter(item => item !== old), goal], description: (old ? 'Updated ' : 'Added ') + goal.name + '.' };
+}
+function requireGoal(goals, terms, user) {
+  requireThat(goals.some(goal => goal.owner === user), 'Add your goal before signing.');
+  requireThat(!terms.forfeit || goals.some(goal => goal.owner === user && goal.counts), 'You need a goal that counts toward the forfeit.');
+}
+function publishDraft(pact, user, now) {
+  const { draft } = pact;
+  const signed = goal => Boolean(draft.signatures[goal.owner]);
+  pact.pendingGoals = draft.goals.filter(goal => !signed(goal));
+  draft.goals = draft.goals.filter(signed);
+  pact.versions.push(draft);
+  pact.draft = null;
+  audit(pact, 'sealed', user, now, 'Published version ' + draft.number + '.');
+}
+function enrolMember(pact, version, user, data, now) {
+  requireThat(version && !pact.draft && data.enrolVersion === version.number && !version.signatures[user],
+    'The group agreement changed. Open the pact to review the latest terms.', 409);
+  const goals = pact.pendingGoals ?? [];
+  const terms = version.terms;
+  const today = localDay(now, terms.zone);
+  if (data.action !== 'sign') {
+    requireThat(today <= terms.end, 'This pact has finished.', 409);
+    const changed = changeGoal(pact, goals, terms, user, data);
+    if (changed) pact.pendingGoals = changed.goals;
+    return;
+  }
+  requireGoal(goals, terms, user);
+  const starts = later(terms.start, now >= wallTime(today, terms.cutoff, terms.zone) ? addDays(today, 1) : today);
+  requireThat(starts <= terms.end, 'There are no check-in days left in this pact.', 409);
+  const own = goals.filter(goal => goal.owner === user && (!goal.due || goal.due >= starts));
+  requireGoal(own, terms, user);
+  version.memberStarts ??= {};
+  version.memberStarts[user] = starts;
+  version.goals.push(...own);
+  version.signatures[user] = now;
+  pact.pendingGoals = goals.filter(goal => goal.owner !== user);
+  audit(pact, 'signed', user, now, 'Joined version ' + version.number + ' with a check-in start of ' + starts + '.');
 }
 
 function resultRecord(pact, version, owner, day, cutoff, previous, now) {
@@ -101,16 +156,26 @@ function resultRecord(pact, version, owner, day, cutoff, previous, now) {
 }
 export function settle(pact, now) {
   let changed = false;
+  const settled = new Set(pact.outcomes.map(outcome => [outcome.version, outcome.day, outcome.owner].join('/')));
   for (const version of pact.versions) {
+    const owners = new Set(version.goals.map(goal => goal.owner));
     for (const { day, cutoff } of checkpoints(pact, version, now)) {
-      for (const { id: owner } of pact.members) {
-        if (pact.outcomes.some(outcome => outcome.owner === owner && outcome.version === version.number && outcome.day === day)) continue;
+      for (const owner of owners) {
+        if (day < version.memberStarts?.[owner] || settled.has([version.number, day, owner].join('/'))) continue;
         pact.outcomes.push(resultRecord(pact, version, owner, day, cutoff, null, now));
         changed = true;
       }
     }
   }
   return changed;
+}
+
+function requireOpenCheckIn(pact, user, version, day) {
+  if (!pact.dailyCheckIns) return;
+  requireThat(!pact.logs.some(log => !log.deleted && log.owner === user && log.version === version && log.day === day)
+    && !pact.requests.some(request => request.type === 'correction' && request.status === 'pending'
+      && request.owner === user && request.entry.version === version && request.entry.day === day && !request.entry.deleted),
+  'A check-in already exists for this day. Open it to edit or review it.', 409);
 }
 
 function logEntry(pact, user, data, now, edit) {
@@ -129,12 +194,12 @@ function logEntry(pact, user, data, now, edit) {
   requireThat(goal, 'Only the owner can log this goal.', 403);
   const window = windowFor(version, goal, day, periodEnd(pact, version));
   requireThat(window, 'There is no check-in planned for this date.');
+  if (!edit) requireOpenCheckIn(pact, user, version.number, day);
   requireThat(!isExcused(pact, user, day) || edit, 'This date has been excused.');
   const amount = data.remove ? 0 : Number(data.amount);
   requireThat(Number.isFinite(amount) && amount >= 0 && amount <= 100000 && Math.abs(amount * 100 - Math.round(amount * 100)) < 0.000001
     && (goal.unit !== 'completion' || [0, 1].includes(amount)), 'Enter a valid amount with at most two decimal places.');
-  const cutoff = goal.cadence === 'weekly' && goal.dailyCheck
-    ? Math.min(window.cutoff, wallTime(day, version.terms.cutoff, version.terms.zone)) : window.cutoff;
+  const cutoff = checkinCutoff(version, goal, day, window);
   const closes = Math.min(window.closes, cutoff + version.terms.grace * 60000);
   const entry = {
     id: existing?.id ?? data.key, owner: user, goal: goal.id, version: version.number, day, amount,
@@ -142,7 +207,7 @@ function logEntry(pact, user, data, now, edit) {
     at: existing?.at ?? now, editedAt: edit ? now : null, late: Boolean(existing?.late || now > cutoff), deleted: Boolean(data.remove)
   };
   if (now > closes) {
-    requireThat(edit, 'That check-in window has closed. Ask your friend to approve a late entry.', 409);
+    requireThat(edit, 'That check-in window has closed. Ask another member to approve a late entry.', 409);
     const pending = pact.requests.find(req => req.type === 'correction' && req.status === 'pending' && req.entry.id === entry.id);
     requireThat(!pending, 'This log already has a correction awaiting approval.', 409);
     pact.requests.push({ id: randomUUID(), owner: user, type: 'correction', entry, status: 'pending', at: now });
@@ -160,7 +225,9 @@ function logEntry(pact, user, data, now, edit) {
 
 function decideRequest(pact, user, data, now) {
   const request = pact.requests.find(item => item.id === data.id && item.status === 'pending');
-  requireThat(request && request.owner !== user, 'Only the other member can decide this request.', 403);
+  const version = request?.entry
+    ? pact.versions.find(item => item.number === request.entry.version) : pact.versions.at(-1);
+  requireThat(request && request.owner !== user && version?.signatures[user], 'Another signed member must review this request.', 403);
   requireThat(['approved', 'declined'].includes(data.decision), 'Choose approve or decline.');
   if (data.decision === 'approved') {
     if (request.type === 'excuse') {
@@ -188,17 +255,28 @@ function decideRequest(pact, user, data, now) {
   audit(pact, request.type, user, now, (data.decision === 'approved' ? 'Approved' : 'Declined') + ' ' + (request.type === 'correction' ? 'a log correction.' : 'excused days.'));
 }
 
-export function applyAction(pact, user, data, now, friendSettings) {
+export function addMember(pact, user, name, now) {
+  requireThat(pact.members.length < GROUP_LIMIT, 'This group already has ' + GROUP_LIMIT + ' members.', 409);
+  pact.members.push({ id: user, name });
+  audit(pact, 'join', user, now, name + ' joined the pact.');
+}
+
+export function applyAction(pact, user, data, now) {
   const action = data.action;
-  requireThat(!pact.endedOn, 'This pact has ended. Its history is available to both members.', 409);
+  requireThat(!pact.endedOn, 'This pact has ended. The group can still view its history.', 409);
   const draft = pact.draft;
   const signed = pact.versions.at(-1);
+  if (['saveGoal', 'deleteGoal', 'sign'].includes(action) && data.enrolVersion !== undefined) {
+    enrolMember(pact, signed, user, data, now);
+    return;
+  }
   if (['terms', 'saveGoal', 'deleteGoal', 'sign'].includes(action)) {
-    requireThat(draft, 'Start a revision to change signed terms.', 409);
-    requireThat(data.revision === draft.revision, 'The terms changed. Review the latest version before trying again.', 409);
+    requireThat(draft, 'This draft has closed. Review the current agreement.', 409);
+    requireThat(data.revision === draft.revision, 'The draft changed. Review the latest version before trying again.', 409);
   }
   if (action === 'terms') {
-    const next = termsFrom(data.terms || {});
+    requireThat(user === pact.owner, 'Only the organiser can edit the group terms.', 403);
+    const next = termsFrom(data.terms || {}, pact.dailyCheckIns);
     const first = localDay(now, next.zone);
     requireThat(next.start >= first && (!signed || (next.zone === signed.terms.zone && next.start > first && next.start > signed.terms.start
       && next.start <= addDays(signed.terms.end, 1))), 'Choose an effective date within the pact or immediately after it. Keep the signed time zone.');
@@ -207,25 +285,16 @@ export function applyAction(pact, user, data, now, friendSettings) {
     const changes = Object.keys(labels).filter(key => draft.terms[key] !== next[key]).map(key => labels[key]);
     if (changes.length) {
       draft.terms = next;
-      reviseDraft(pact, user, now, 'Updated the ' + changes.join(', ') + '.');
+      reviseDraft(pact, user, now, 'Updated the ' + changes.join(', ') + '.', true);
     }
   } else if (action === 'saveGoal' || action === 'deleteGoal') {
-    const old = draft.goals.find(goal => goal.id === data.goal?.id);
-    requireThat(!data.goal?.id || (old && old.owner === user), 'Only the owner can change this goal.', 403);
-    if (action === 'saveGoal') {
-      requireThat(old || draft.goals.filter(goal => goal.owner === user).length < 12, 'Each person can have up to 12 goals per version.');
-      const goal = goalFrom(data.goal || {}, old, user, draft.terms);
-      if (old && JSON.stringify(old) === JSON.stringify(goal)) return;
-      draft.goals = [...draft.goals.filter(item => item.id !== goal.id), goal];
-      reviseDraft(pact, user, now, (old ? 'Updated ' : 'Added ') + goal.name + '.');
-    } else {
-      requireThat(old, 'That goal is unavailable.', 404);
-      draft.goals = draft.goals.filter(goal => goal.id !== old.id);
-      reviseDraft(pact, user, now, 'Removed ' + old.name + '.');
+    const changed = changeGoal(pact, draft.goals, draft.terms, user, data);
+    if (changed) {
+      draft.goals = changed.goals;
+      reviseDraft(pact, user, now, changed.description);
     }
   } else if (action === 'sign') {
-    requireThat(pact.members.length === 2 && pact.members.every(member => draft.goals.some(goal => goal.owner === member.id)), 'Both friends need at least one goal before signing.');
-    requireThat(!draft.terms.forfeit || pact.members.every(member => draft.goals.some(goal => goal.owner === member.id && goal.counts)), 'Each friend needs a goal that counts toward the forfeit.');
+    requireGoal(draft.goals, draft.terms, user);
     const day = localDay(now, draft.terms.zone);
     requireThat(draft.terms.start >= day && (!signed || draft.terms.start > day)
       && (draft.terms.start !== day || (now < wallTime(day, draft.terms.cutoff, draft.terms.zone)
@@ -234,20 +303,20 @@ export function applyAction(pact, user, data, now, friendSettings) {
       draft.signatures[user] = now;
       audit(pact, 'signed', user, now, 'Signed pact version ' + draft.number + '.');
     }
-    if (pact.members.every(member => draft.signatures[member.id])) {
-      pact.versions.push(draft);
-      pact.draft = null;
-      audit(pact, 'sealed', user, now, 'Both signatures received for version ' + draft.number + '.');
-    }
+    const required = signed ? Object.keys(signed.signatures) : [pact.owner];
+    if (required.every(memberId => draft.signatures[memberId])) publishDraft(pact, user, now);
   } else if (action === 'revision') {
+    requireThat(user === pact.owner, 'Only the organiser can open a revision.', 403);
     requireThat(signed && !draft, 'There is already an open version or the pact is unsigned.', 409);
     const start = addDays([localDay(now, signed.terms.zone), signed.terms.start].sort().at(-1), 1);
     requireThat(start <= addDays(signed.terms.end, 1), 'This pact has ended. Create a new pact to go again.', 409);
-    const goals = signed.goals.filter(goal => !goal.due || goal.due >= start);
+    const goals = [...signed.goals, ...(pact.pendingGoals ?? [])].filter(goal => !goal.due || goal.due >= start);
     pact.draft = { number: signed.number + 1, revision: 1, terms: { ...signed.terms, start, end: signed.terms.end >= start ? signed.terms.end : start }, goals, signatures: {}, change: 'Opened a draft for future dates.' };
     audit(pact, 'draft', user, now, pact.draft.change);
   } else if (action === 'discardRevision') {
+    requireThat(user === pact.owner, 'Only the organiser can discard a revision.', 403);
     requireThat(signed && draft && data.revision === draft.revision, 'This revision changed or was already signed.', 409);
+    pact.pendingGoals = draft.goals.filter(goal => !signed.signatures[goal.owner] && (!goal.due || goal.due <= signed.terms.end));
     pact.draft = null;
     audit(pact, 'draft', user, now, 'Discarded the unsigned revision.');
   } else if (action === 'log' || action === 'editLog') {
@@ -264,7 +333,8 @@ export function applyAction(pact, user, data, now, friendSettings) {
     requireThat(goal && data.day <= localDay(now, version.terms.zone), 'This goal or date is unavailable.');
     const window = windowFor(version, goal, data.day, periodEnd(pact, version));
     requireThat(window && !isExcused(pact, user, data.day), 'There is no check-in planned for this date.');
-    const cutoff = goal.cadence === 'weekly' && goal.dailyCheck ? Math.min(window.cutoff, wallTime(data.day, version.terms.cutoff, version.terms.zone)) : window.cutoff;
+    requireOpenCheckIn(pact, user, version.number, data.day);
+    const cutoff = checkinCutoff(version, goal, data.day, window);
     requireThat(now > cutoff + version.terms.grace * 60000, 'This check-in is still open. Save it directly.');
     const amount = Number(data.amount);
     requireThat(Number.isFinite(amount) && amount >= 0 && amount <= 100000 && Math.abs(amount * 100 - Math.round(amount * 100)) < 0.000001
@@ -275,9 +345,10 @@ export function applyAction(pact, user, data, now, friendSettings) {
     audit(pact, 'correction', user, now, 'Requested a late entry for ' + goal.name + ' on ' + data.day + '.');
   } else if (action === 'excuse') {
     requireThat(signed && validDay(data.first) && validDay(data.last) && data.first <= data.last, 'Choose the dates you want excused.');
+    requireThat(signed.signatures[user], 'Sign the agreement before requesting excused days.', 403);
     requireThat(data.first >= pact.versions[0].terms.start && data.last <= signed.terms.end, 'Excuse dates must be inside signed pact dates.');
     requireThat(!pact.outcomes.some(outcome => outcome.owner === user && outcome.day >= data.first && startWeek(outcome.day) <= data.last), 'A checkpoint in that period has already closed.', 409);
-    requireThat(!pact.requests.some(req => req.type === 'excuse' && req.owner === user && req.status === 'pending'), 'You already have a request awaiting your friend.', 409);
+    requireThat(!pact.requests.some(req => req.type === 'excuse' && req.owner === user && req.status === 'pending'), 'You already have a pending request.', 409);
     pact.requests.push({ id: randomUUID(), owner: user, type: 'excuse', first: data.first, last: data.last, reason: clean(data.reason, 140), status: 'pending', at: now });
     audit(pact, 'excuse', user, now, 'Requested excused days.');
   } else if (action === 'decision') {
@@ -285,6 +356,7 @@ export function applyAction(pact, user, data, now, friendSettings) {
   } else if (action === 'flagOutcome') {
     const item = pact.outcomes.find(result => result.id === data.id);
     requireThat(item, 'This checkpoint is unavailable.', 404);
+    requireThat(pact.versions.find(version => version.number === item.version)?.signatures[user], 'Only signed members can flag this result.', 403);
     requireThat(!item.flagBy, 'This result is already flagged.', 409);
     item.flag = clean(data.reason, 160) || 'Please review the saved logs.';
     item.flagBy = user;
@@ -293,36 +365,23 @@ export function applyAction(pact, user, data, now, friendSettings) {
   } else if (action === 'forfeit') {
     const item = pact.outcomes.find(result => result.id === data.id && result.forfeit);
     requireThat(item, 'This forfeit is unavailable.', 404);
+    requireThat(pact.versions.find(version => version.number === item.version)?.signatures[user], 'Only signed members can review this forfeit.', 403);
     requireThat(!['confirmed', 'waived', 'void'].includes(item.status), 'This forfeit is already closed.', 409);
     if (data.mode === 'done' && item.owner === user && ['triggered', 'flagged'].includes(item.status)) item.status = 'done';
     else if (data.mode === 'confirm' && item.owner !== user && item.status === 'done') item.status = 'confirmed';
-    else if (data.mode === 'waive') {
+    else if (data.mode === 'waive' && (user === item.owner || item.waiverBy.includes(item.owner))) {
       item.waiverBy = [...new Set([...item.waiverBy, user])];
-      if (item.waiverBy.length === 2) item.status = 'waived';
+      if (item.waiverBy.length > 1) item.status = 'waived';
     } else throw new AppError(409, 'That action is unavailable for this forfeit.');
     audit(pact, 'forfeit', user, now, 'Forfeit for ' + item.day + ' · ' + (data.mode === 'waive' && item.status !== 'waived' ? 'waiver requested' : item.status) + '.');
-  } else if (action === 'cheer' || action === 'nudge') {
-    requireThat(pact.members.length === 2, 'Invite a friend first.');
-    const friend = pact.members.find(member => member.id !== user);
-    if (action === 'nudge') {
-      requireThat(!friendSettings?.mute, 'Your friend has muted nudges.', 409);
-      if (friendSettings?.quiet && friendSettings.quietStart !== friendSettings.quietEnd) {
-        const clock = localClock(now, friendSettings.zone);
-        const { quietStart, quietEnd } = friendSettings;
-        const quiet = quietStart < quietEnd ? clock >= quietStart && clock < quietEnd : clock >= quietStart || clock < quietEnd;
-        requireThat(!quiet, 'Your friend is in quiet hours.', 409);
-      }
-    }
-    const interval = action === 'nudge' ? 8 * 3600000 : 3600000;
-    requireThat(!pact.signals.some(signal => signal.type === action && signal.from === user && now - signal.at < interval),
-      action === 'nudge' ? 'You can send another nudge in eight hours from your last one.' : 'You already cheered in the past hour.', 429);
-    pact.signals = [...pact.signals.slice(-99), { id: randomUUID(), type: action, from: user, to: friend.id, at: now }];
-  } else if (action === 'leave') {
+  } else if (action === 'endPact') {
+    requireThat(user === pact.owner, 'Only the organiser can end the group pact.', 403);
     const zone = signed?.terms.zone ?? draft.terms.zone;
     pact.endedOn = localDay(now, zone);
     pact.endedAt = now;
     pact.draft = null;
-    audit(pact, 'left', user, now, 'Ended this pact. Signed terms and history have been kept.');
+    pact.pendingGoals = [];
+    audit(pact, 'ended', user, now, 'Ended this pact.');
   } else throw new AppError(400, 'Unknown pact action.');
 }
 
@@ -332,9 +391,10 @@ function visibleLog(log, user) {
   return shareNote ? { ...rest, note, shareNote } : rest;
 }
 export function visiblePact(row, user) {
-  const { document: pact } = row;
+  const { signals, ...pact } = row.document;
   return {
     ...pact,
+    pendingGoals: (pact.pendingGoals ?? []).filter(goal => goal.owner === user),
     inviteExpires: row.invite_hash && row.invite_expires_at ? +new Date(row.invite_expires_at) : null,
     logs: pact.logs.map(log => visibleLog(log, user)),
     requests: pact.requests.map(request => request.entry ? { ...request, entry: visibleLog(request.entry, user) } : request)

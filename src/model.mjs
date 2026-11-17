@@ -1,5 +1,5 @@
-import { addDays, browserZone, localDay, startWeek, wallTime, weekday } from '../shared/time.mjs';
-import { periodEnd, progressFor, versionAt } from '../shared/scoring.mjs';
+import { addDays, browserZone, labelDay, localDay, startWeek, wallTime, weekday } from '../shared/time.mjs';
+import { pendingCheckIn, periodEnd, progressFor, versionAt } from '../shared/scoring.mjs';
 
 export async function api(action, data = {}) {
   let res;
@@ -11,7 +11,7 @@ export async function api(action, data = {}) {
       signal: AbortSignal.timeout(14000)
     });
   } catch {
-    throw new Error('Couldn’t reach Show Up. Check your connection and try again.');
+    throw Object.assign(new Error('Couldn’t reach Show Up. Check your connection and try again.'), { connection: true });
   }
   const result = await res.json().catch(() => ({}));
   if (!res.ok) throw Object.assign(new Error(result.error ?? 'The app couldn’t complete that request.'), { status: res.status });
@@ -20,12 +20,10 @@ export async function api(action, data = {}) {
 export const latestTerms = pact => (pact.draft ?? pact.versions.at(-1))?.terms;
 export const pactName = pact => latestTerms(pact)?.name ?? 'Pact history';
 export const pactZone = pact => latestTerms(pact)?.zone ?? browserZone();
-export const partner = (pact, user) => pact.members.find(member => member.id !== user);
 export const initials = name => name.split(/\s+/).slice(0, 2).map(part => [...part][0]).join('').toLocaleUpperCase() || '?';
 export function pactStatus(pact, now) {
   if (pact.endedOn) return 'Ended';
-  if (pact.members.length === 1) return 'Invite a friend';
-  if (!pact.versions.length) return 'Awaiting signatures';
+  if (!pact.versions.length) return 'Draft';
   const today = localDay(now, pactZone(pact));
   if (today > pact.versions.at(-1).terms.end) return 'Finished';
   if (!versionAt(pact, today)) return 'Starts soon';
@@ -35,13 +33,40 @@ export function entriesFor(pacts, day, now) {
   return pacts.flatMap(pact => {
     const version = versionAt(pact, day);
     if (!version) return [];
-    return version.goals.map(goal => ({ pact, version, goal, day, progress: progressFor(pact, version, goal, day, now) }));
+    return version.goals.filter(goal => !version.memberStarts?.[goal.owner] || day >= version.memberStarts[goal.owner])
+      .map(goal => ({ pact, version, goal, day, progress: progressFor(pact, version, goal, day, now) }));
   });
+}
+export function existingCheckIn(entry) {
+  if (!entry.pact.dailyCheckIns) return null;
+  return entry.pact.logs.find(log => !log.deleted && log.owner === entry.goal.owner && log.version === entry.version.number && log.day === entry.day) ?? null;
+}
+export function pendingCorrection(entry) {
+  return entry.pact.requests.some(request => request.type === 'correction' && request.owner === entry.goal.owner
+    && request.status === 'pending' && request.entry.goal === entry.goal.id && request.entry.day === entry.day
+    && request.entry.version === entry.version.number);
+}
+export function pactNotices(pacts, user, now) {
+  return pacts.flatMap(pact => {
+    if (pact.endedOn) return [];
+    const latest = pact.versions.at(-1);
+    const latestSign = user.id === pact.owner ? [...pact.history].reverse().find(event => event.type === 'join') : null;
+    const notices = pact.requests.filter(req => req.owner !== user.id && req.status === 'pending'
+      && (req.entry ? pact.versions.find(item => item.number === req.entry.version) : latest)?.signatures[user.id])
+      .map(req => ({ id: req.id, at: req.at, pact, message: req.type === 'excuse' ? 'Review an excused-days request.' : 'Review a proposed check-in change.' }));
+    for (const result of pact.outcomes.filter(result => result.owner === user.id && ['triggered', 'flagged'].includes(result.status))) {
+      notices.push({ id: result.id, at: result.cutoff, pact, message: 'Forfeit due ' + labelDay(result.due) + '.' });
+    }
+    if (latestSign) notices.push({ id: latestSign.id, at: latestSign.at, pact, message: latestSign.description });
+    const due = pendingCheckIn(pact, user.id, now);
+    if (due) notices.push({ id: pact.id + '-' + due.day, at: due.at, pact, today: true, message: 'Your check-in is still open.' });
+    return notices;
+  }).sort((a, b) => b.at - a.at);
 }
 export function defaultTerms(now) {
   const zone = browserZone();
   const today = localDay(now, zone);
-  return { name: '', start: today, end: addDays(today, 27), cutoff: '23:59', zone, grace: 60, rule: 'target', missLimit: 2, forfeit: '', forfeitDays: 3 };
+  return { name: '', start: today, end: addDays(today, 27), cutoff: '23:59', zone, grace: 60, rule: 'checkins', missLimit: 2, forfeit: '', forfeitDays: 3 };
 }
 export const monthStart = day => day.slice(0, 7) + '-01';
 export function moveMonth(day, difference) {
@@ -102,20 +127,26 @@ export function demoData(now) {
   const today = localDay(now, zone);
   const start = startWeek(today);
   const cutoff = '23:59';
-  const you = { id: 'demo-me', name: 'Alex Park', handle: 'alex', settings: { zone }, events: [], favourites: {} };
-  const mate = { id: 'demo-mate', name: 'Sam Taylor' };
+  const you = { id: 'demo-alex', name: 'Alex Park', handle: 'alex', settings: { zone }, events: [], favourites: {}, inboxSince: 0 };
+  const members = [you, { id: 'demo-sam', name: 'Sam Taylor' }, { id: 'demo-morgan', name: 'Morgan Lee' },
+    { id: 'demo-jules', name: 'Jules Chen' }, { id: 'demo-riley', name: 'Riley Singh' }];
   const makeGoal = (properties) => ({ target: 1, unit: 'sessions', topic: '', days: [], due: null, dueTime: null, dailyCheck: false, counts: true, ...properties });
   const goals = [
-    makeGoal({ id: 'd-study', category: 'Study', focus: 'Chemistry', topic: 'Module 4 · Practice questions', name: 'Chemistry revision', unit: 'min', target: 120, cadence: 'weekly', dailyCheck: true, owner: you.id }),
-    makeGoal({ id: 'd-legs', category: 'Fitness', focus: 'Muscle group', topic: 'Quads & hamstrings', name: 'Lower-body session', cadence: 'scheduled', days: [...new Set([weekday(today), (weekday(today) + 3) % 7])], owner: you.id }),
-    makeGoal({ id: 'd-read', category: 'Custom', focus: 'Reading', name: 'Read before bed', unit: 'pages', target: 15, cadence: 'daily', owner: you.id }),
-    makeGoal({ id: 'd-mate', category: 'Fitness', focus: 'Workout consistency', name: 'Upper-body sessions', target: 3, cadence: 'weekly', owner: mate.id }),
-    makeGoal({ id: 'd-paper', category: 'Study', focus: 'Maths', name: 'Finish a practice paper', unit: 'completion', cadence: 'deadline', due: addDays(start, 6), dueTime: '18:00', owner: mate.id })
+    makeGoal({ id: 'd-study', category: 'Study', focus: 'Chemistry', topic: 'Module 4 · Practice questions', name: 'Chemistry revision', unit: 'min', target: 25, cadence: 'daily', owner: you.id }),
+    makeGoal({ id: 'd-run', category: 'Fitness', focus: 'Cardio', name: 'Run 10 km this week', unit: 'km', target: 10, cadence: 'weekly', dailyCheck: true, owner: members[1].id }),
+    makeGoal({ id: 'd-read', category: 'Custom', focus: 'Reading', name: 'Read before bed', unit: 'pages', target: 15, cadence: 'daily', owner: members[2].id }),
+    makeGoal({ id: 'd-paper', category: 'Study', focus: 'Maths', name: 'Practice maths', unit: 'completion', cadence: 'daily', owner: members[3].id }),
+    makeGoal({ id: 'd-walk', category: 'Fitness', focus: 'Cardio', name: 'Take a lunch break walk', unit: 'min', target: 15, cadence: 'daily', owner: members[4].id })
   ];
-  const terms = { name: 'The November reset', start, end: addDays(start, 27), cutoff, zone, grace: 60, rule: 'target', missLimit: 2, forfeit: 'Make next week’s shared playlist', forfeitDays: 3 };
-  const version = { number: 1, revision: 3, terms, goals, signatures: { [you.id]: now - 240000, [mate.id]: now - 180000 }, change: 'Both friends set their goals.' };
+  const terms = { name: 'The evening reset', start, end: addDays(start, 27), cutoff, zone, grace: 60, rule: 'checkins', missLimit: 2, forfeit: 'Buy another member a Slushie.', forfeitDays: 3 };
+  const version = { number: 1, revision: 3, terms, goals, signatures: Object.fromEntries(members.map(member => [member.id, now - 240000])), change: 'The group set their goals.' };
   const log = (id, goal, amount, owner, offset) => ({ id, goal, amount, owner, version: 1, day: today, at: now - offset, late: false, deleted: false });
-  return { user: you, pacts: [{ id: 'demo', owner: you.id, members: [you, mate], draft: null, versions: [version],
-    logs: [log('a', 'd-study', 85, you.id, 8700000), log('b', 'd-mate', 2, mate.id, 2400000), log('c', 'd-read', 15, you.id, 1800000)],
-    history: [], requests: [], outcomes: [], signals: [], endedOn: null }] };
+  const pact = { id: 'demo', owner: you.id, members, draft: null, versions: [version], dailyCheckIns: true,
+    logs: [log('a', 'd-run', 2, members[1].id, 2400000), log('b', 'd-read', 15, members[2].id, 1800000)],
+    history: [], requests: [], outcomes: [], endedOn: null };
+  const reading = makeGoal({ id: 'd-personal', category: 'Custom', focus: 'Reading', name: 'Read for 20 minutes', unit: 'min', target: 20, cadence: 'daily', owner: you.id });
+  const other = { ...pact, id: 'demo-reading', members: [you, members[2]], versions: [{
+    ...version, terms: { ...terms, name: 'Reading group' }, goals: [reading, goals[2]]
+  }], logs: [log('c', reading.id, 20, you.id, 900000)] };
+  return { user: you, invites: [], pacts: [pact, other] };
 }

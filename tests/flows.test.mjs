@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { addDays, localDay, wallTime } from '../shared/time.mjs';
-import { progressFor, versionAt } from '../shared/scoring.mjs';
+import { pendingCheckIn, progressFor, versionAt } from '../shared/scoring.mjs';
+import { reminderHandler } from '../server/push.mjs';
 import { harness } from './harness.mjs';
 
 const zone = 'Australia/Sydney';
@@ -35,7 +37,7 @@ test('Sydney day boundaries, repeated clock times and DST gap', () => {
   assert.equal(localDay(at('2026-10-25', '23:50') + 30 * 60000, zone), '2026-10-26');
 });
 
-test('two-account pact lifecycle with expired/revoked links, versioning, check-ins, privacy and checkpoints', async t => {
+test('legacy scoring and history survive the group migration', async t => {
   let now = at('2026-10-10', '12:00');
   const app = await harness(() => now, { secure: true });
   t.after(() => app.close());
@@ -56,6 +58,7 @@ test('two-account pact lifecycle with expired/revoked links, versioning, check-i
   const created = await ok(alice('create', { terms }));
   const pactId = created.pact.id;
   const call = (session, action, data = {}) => session(action, { pactId, ...data });
+  await app.db.query("UPDATE showup_pacts SET document=document-'dailyCheckIns' WHERE id=$1", [pactId]);
   const first = await ok(call(alice, 'invite'));
   now = at('2026-10-18', '12:00');
   await err(sam('invitePreview', { token: first.inviteToken }), 404, /expired/);
@@ -67,15 +70,18 @@ test('two-account pact lifecycle with expired/revoked links, versioning, check-i
   const inviteKey = third.inviteToken;
   const { invite } = await ok(sam('invitePreview', { token: inviteKey }));
   assert.deepEqual(Object.keys(invite).sort(), ['expires', 'from', 'name']);
-  await err(alice('join', { token: inviteKey }), 409, /your invitation/);
+  assert.equal((await ok(alice('join', { token: inviteKey }))).pact.members.length, 1);
   const joined = await Promise.all([sam('join', { token: inviteKey }), sam('join', { token: inviteKey })]);
   const joinedPact = (await ok(joined[0])).pact;
   assert.equal((await ok(joined[1])).pact.members.length, 2);
   assert.equal(joinedPact.members[1].id, friendId);
-  await err(stranger('join', { token: inviteKey }), 409);
+  await app.db.query('UPDATE showup_pacts SET friend_id=$1 WHERE id=$2', [friendId, pactId]);
+  await app.db.query('DELETE FROM showup_pact_members WHERE pact_id=$1', [pactId]);
+  await app.exec(await readFile(new URL('../server/schema.sql', import.meta.url), 'utf8'));
+  assert.equal((await ok(sam('sync'))).pacts[0].id, pactId);
   assert.equal((await ok(stranger('sync'))).pacts.length, 0);
   await err(call(stranger, 'log', { key: randomUUID() }), 404);
-  await err(call(alice, 'sign', { revision: 1 }), 400, /need at least one goal/);
+  await err(call(alice, 'sign', { revision: 1 }), 400, /Add your goal/);
 
   let pact = (await ok(call(alice, 'saveGoal', { revision: 1, goal: wanted('Study', 'Chemistry revision', { unit: 'min', target: 120, dailyCheck: true }) }))).pact;
   const study = pact.draft.goals[0];
@@ -83,14 +89,15 @@ test('two-account pact lifecycle with expired/revoked links, versioning, check-i
   const legs = pact.draft.goals.find(goal => goal.name === 'Legs');
   pact = (await ok(call(sam, 'saveGoal', { revision: 3, goal: wanted('Fitness', 'Train twice') }))).pact;
   const train = pact.draft.goals.find(goal => goal.owner === friendId);
-  pact = (await ok(call(alice, 'sign', { revision: 4 }))).pact;
-  assert.equal(pact.draft.signatures[ownerId], now);
-  pact = (await ok(call(sam, 'terms', { revision: 4, terms: { ...terms, forfeit: 'Pick the next study spot' } }))).pact;
+  pact = (await ok(call(sam, 'sign', { revision: 4 }))).pact;
+  assert.equal(pact.draft.signatures[friendId], now);
+  await err(call(sam, 'terms', { revision: 4, terms }), 403);
+  pact = (await ok(call(alice, 'terms', { revision: 4, terms: { ...terms, forfeit: 'Pick the next study spot' } }))).pact;
   assert.deepEqual(pact.draft.signatures, {});
-  await err(call(alice, 'sign', { revision: 4 }), 409, /terms changed/);
-  const signed = await Promise.all([call(alice, 'sign', { revision: 5 }), call(sam, 'sign', { revision: 5 })]);
-  const sealed = await Promise.all(signed.map(ok));
-  assert.equal(sealed.filter(item => item.pact.versions.length === 1).length, 1);
+  await err(call(alice, 'sign', { revision: 4 }), 409, /draft changed/);
+  await ok(call(sam, 'sign', { revision: 5 }));
+  const { pact: sealed } = await ok(call(alice, 'sign', { revision: 5 }));
+  assert.equal(Object.keys(sealed.versions[0].signatures).length, 2);
   now = at('2026-10-19', '10:00');
   const key = randomUUID();
   await err(call(sam, 'log', { key: randomUUID(), goalId: study.id, day: terms.start, amount: 25 }), 403);
@@ -155,12 +162,10 @@ test('two-account pact lifecycle with expired/revoked links, versioning, check-i
   assert.equal(versionAt(pact, '2026-10-27').goals.find(goal => goal.id === study.id).target, 90);
   assert.equal(pact.outcomes.find(item => item.id === forfeit.id).status, 'void');
 
-  await ok(sam('settings', { settings: { mute: true, quiet: false, quietStart: '22:00', quietEnd: '07:00', zone } }));
-  await err(call(alice, 'nudge'), 409, /muted/);
-  await ok(call(alice, 'cheer'));
-  await err(call(alice, 'cheer'), 429);
-  await ok(call(sam, 'leave'));
-  await err(call(alice, 'cheer'), 409);
+  await ok(sam('settings', { settings: { zone } }));
+  await err(call(sam, 'endPact'), 403);
+  await ok(call(alice, 'endPact'));
+  await err(call(sam, 'revision'), 409);
   pact = (await ok(alice('sync'))).pacts[0];
   assert.equal(pact.versions.length, 2);
   assert.equal(pact.endedOn, '2026-10-26');
@@ -168,4 +173,93 @@ test('two-account pact lifecycle with expired/revoked links, versioning, check-i
   await err(sam('sync'), 401);
   await ok(sam('login', { handle: 'sam_taylor', password }));
   assert.equal((await ok(sam('sync'))).pacts.length, 1);
+});
+
+test('shared group invites, late enrolment, one check-in per member per day and reminder delivery', async t => {
+  let now = at('2026-10-19', '09:00');
+  const app = await harness(() => now);
+  t.after(() => app.close());
+  const [host, lee, sam, casey, outsider] = Array.from({ length: 5 }, () => app.session());
+  const people = [
+    [host, 'host', 'Taylor Host'], [lee, 'lee', 'Lee Chan'], [sam, 'sam', 'Sam Taylor'],
+    [casey, 'casey', 'Casey Smith'], [outsider, 'outsider', 'Uninvited User']
+  ];
+  const [hostId, leeId, samId, caseyId] = await Promise.all(people.map(async ([session, handle, name]) =>
+    (await ok(session('signup', { handle, name, password, zone }))).user.id));
+  const groupTerms = { ...terms, forfeit: 'Give another member $5 or buy them a Yo-Chi.', rule: 'checkins' };
+  await err(host('create', { terms: { ...groupTerms, forfeit: '' } }), 400, /Write or randomise/);
+  const { pact: created } = await ok(host('create', { terms: groupTerms }));
+  const call = (session, action, data = {}) => session(action, { pactId: created.id, ...data });
+  const { inviteToken } = await ok(call(host, 'invite'));
+  assert.equal((await ok(call(host, 'inviteLink'))).inviteToken, inviteToken);
+  await err(call(outsider, 'join'), 404);
+  await Promise.all([lee, sam].map(session => ok(session('join', { token: inviteToken }))));
+  let pact = (await ok(host('sync'))).pacts[0];
+  assert.equal(pact.members.length, 3);
+  assert.equal(JSON.stringify(pact).includes(inviteToken), false);
+  await err(call(lee, 'inviteLink'), 403);
+  await ok(call(host, 'inviteAccount', { handle: 'casey' }));
+  assert.equal((await ok(outsider('sync'))).invites.length, 0);
+  assert.equal((await ok(casey('sync'))).invites[0].name, groupTerms.name);
+  await ok(call(casey, 'declineInvite'));
+  assert.equal((await ok(casey('sync'))).invites.length, 0);
+  await ok(call(host, 'inviteAccount', { handle: 'casey' }));
+  assert.equal((await ok(call(casey, 'join'))).pact.members.length, 4);
+  assert.equal((await ok(casey('sync'))).invites.length, 0);
+
+  const goal = wanted('Custom', 'Read twenty pages', { cadence: 'daily', unit: 'pages', target: 20 });
+  pact = (await ok(call(host, 'saveGoal', { revision: 1, goal }))).pact;
+  await err(call(host, 'saveGoal', { revision: pact.draft.revision, goal }), 400, /existing goal/);
+  pact = (await ok(call(host, 'sign', { revision: pact.draft.revision }))).pact;
+  assert.deepEqual(Object.keys(pact.versions[0].signatures), [hostId]);
+  assert.equal(pact.versions[0].terms.forfeit, groupTerms.forfeit);
+  assert.ok(pendingCheckIn(pact, hostId, now));
+  assert.equal(pendingCheckIn(pact, leeId, now), null);
+  const hostGoal = pact.versions[0].goals[0];
+  const log = { goalId: hostGoal.id, day: terms.start, amount: 0, note: 'A personal note' };
+  const firstKey = randomUUID();
+  const results = await Promise.all([call(host, 'log', { ...log, key: firstKey }), call(host, 'log', { ...log, key: randomUUID() })]);
+  assert.deepEqual(results.map(result => result.status).sort(), [200, 409]);
+  const saved = results.find(result => result.status === 200).body.pact.logs[0];
+  await ok(call(host, 'log', { ...log, key: saved.id }));
+  await ok(call(host, 'editLog', { logId: saved.id, amount: 6 }));
+  pact = (await ok(lee('sync'))).pacts[0];
+  assert.equal(pact.logs.length, 1);
+  assert.equal(pact.logs[0].note, undefined);
+  assert.equal(pendingCheckIn(pact, hostId, now), null);
+  assert.equal(progressFor(pact, pact.versions[0], hostGoal, terms.start, now).checked, true);
+
+  now = at('2026-10-26', '09:00');
+  for (const session of [lee, sam, casey]) {
+    const pending = (await ok(call(session, 'saveGoal', { enrolVersion: 1, goal: { ...goal, cadence: 'weekly' } }))).pact;
+    assert.equal(pending.pendingGoals.length, 1);
+    pact = (await ok(call(session, 'sign', { enrolVersion: 1 }))).pact;
+  }
+  const signed = pact.versions[0];
+  assert.equal(signed.goals.find(goal => goal.owner === leeId).dailyCheck, true);
+  assert.equal(signed.memberStarts[caseyId], '2026-10-26');
+  assert.deepEqual(pact.outcomes.map(result => result.owner), [hostId]);
+  await err(call(lee, 'lateLog', { key: randomUUID(), goalId: signed.goals.find(goal => goal.owner === leeId).id, day: terms.start, amount: 1 }), 400);
+  await ok(call(host, 'log', { key: randomUUID(), goalId: hostGoal.id, day: '2026-10-26', amount: 20 }));
+
+  const subscriptions = [[hostId, 'host'], [leeId, 'lee'], [samId, 'sam']];
+  for (const [id, handle] of subscriptions) {
+    const endpoint = 'https://fcm.googleapis.com/fcm/send/' + handle;
+    await app.db.query('INSERT INTO showup_push_subscriptions(endpoint,account_id,subscription) VALUES($1,$2,$3::text::jsonb)',
+      [endpoint, id, JSON.stringify({ endpoint })]);
+  }
+  const env = { CRON_SECRET: 'test-only-sample', VAPID_SUBJECT: 'mailto:qa@example.com', VAPID_PUBLIC_KEY: 'test-public', VAPID_PRIVATE_KEY: 'test-private' };
+  const sent = [];
+  const handler = reminderHandler(app.db, { env, clock: () => now, send: async (subscription, payload) => {
+    sent.push(subscription.endpoint.split('/').at(-1));
+    assert.equal(JSON.parse(payload).notification.navigate, 'https://showup.test/?view=today');
+    if (subscription.endpoint.endsWith('/sam')) throw Object.assign(new Error('expired subscription'), { statusCode: 410 });
+  } });
+  const request = headers => new Request('https://showup.test/api/reminders', { headers });
+  assert.equal((await handler(request())).status, 401);
+  const authorized = () => request({ authorization: 'Bearer ' + env.CRON_SECRET });
+  assert.deepEqual(await (await handler(authorized())).json(), { sent: 1, expired: 1, failed: 0 });
+  assert.deepEqual(await (await handler(authorized())).json(), { sent: 0, expired: 0, failed: 0 });
+  assert.deepEqual(sent.sort(), ['lee', 'sam']);
+  assert.equal((await app.db.query('SELECT endpoint FROM showup_push_subscriptions ORDER BY endpoint')).rows.length, 2);
 });

@@ -16,21 +16,27 @@ export function versionAt(pact, day) {
   return pact.versions.find(version => day >= version.terms.start && day <= periodEnd(pact, version));
 }
 export function windowFor(version, goal, day, end) {
-  if (day < version.terms.start || day > end) return null;
+  const starts = later(version.terms.start, version.memberStarts?.[goal.owner] ?? version.terms.start);
+  if (day < starts || day > end) return null;
   if (goal.cadence === 'scheduled' && !goal.days.includes(weekday(day))) return null;
   let first = day;
   let last = day;
   if (goal.cadence === 'weekly') {
-    first = later(version.terms.start, startWeek(day));
+    first = later(starts, startWeek(day));
     last = earlier(end, addDays(startWeek(day), 6));
   }
   if (goal.cadence === 'deadline') {
     last = goal.due;
-    first = version.terms.start;
+    first = starts;
     if (last > end || day > last) return null;
   }
   const cutoff = wallTime(last, goal.cadence === 'deadline' ? goal.dueTime : version.terms.cutoff, version.terms.zone);
   return { first, last, cutoff, closes: cutoff + version.terms.grace * 60000 };
+}
+export function checkinCutoff(version, goal, day, window) {
+  return goal.cadence === 'weekly' && goal.dailyCheck
+    ? Math.min(window.cutoff, wallTime(day, version.terms.cutoff, version.terms.zone))
+    : window.cutoff;
 }
 export function isExcused(pact, user, day) {
   return pact.requests.some(request => request.type === 'excuse' && request.status === 'approved'
@@ -45,12 +51,30 @@ export function progressFor(pact, version, goal, day, now) {
   if (isExcused(pact, goal.owner, day)) return { state: 'Excused', amount, checked, window };
   let state = 'Due today';
   const checkRequired = goal.cadence === 'weekly' && goal.dailyCheck;
-  const checkCloses = wallTime(day, version.terms.cutoff, version.terms.zone) + version.terms.grace * 60000;
+  const checkCloses = checkinCutoff(version, goal, day, window) + version.terms.grace * 60000;
   if (checkRequired && !checked && now > checkCloses) state = 'Missed';
   else if (amount >= goal.target && (!checkRequired || checked)) state = 'Logged';
   else if (now > window.closes) state = 'Missed';
   else if (amount > 0 || checked) state = 'Partial';
   return { state, amount, checked, window };
+}
+
+export function pendingCheckIn(pact, user, now) {
+  if (pact.endedOn || !pact.versions.length) return null;
+  const day = localDay(now, pact.versions.at(-1).terms.zone);
+  const version = versionAt(pact, day);
+  if (!version || isExcused(pact, user, day)) return null;
+  const due = version.goals.some(goal => {
+    if (goal.owner !== user) return false;
+    const window = windowFor(version, goal, day, periodEnd(pact, version));
+    if (!window || (goal.cadence === 'deadline' && day !== goal.due)) return false;
+    if (goal.cadence === 'weekly' && !goal.dailyCheck && day !== window.last) return false;
+    const close = checkinCutoff(version, goal, day, window) + version.terms.grace * 60000;
+    if (now > close || logsFor(pact, version, goal, day, day).length) return false;
+    return !pact.requests.some(request => request.type === 'correction' && request.status === 'pending'
+      && request.entry.version === version.number && request.entry.goal === goal.id && request.entry.day === day && !request.entry.deleted);
+  });
+  return due ? { day, at: Math.max(version.signatures[user] ?? 0, wallTime(day, '00:00', version.terms.zone)) } : null;
 }
 function scheduledCheckDays(version, goal, first, last) {
   if (goal.cadence === 'weekly' && !goal.dailyCheck) return [last];

@@ -1,0 +1,20 @@
+{
+  "id": "/",
+  "name": "Show Up",
+  "short_name": "Show Up",
+  "description": "Set a goal, share a group pact and check in every day.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f9f8f1",
+  "theme_color": "#f9f8f1",
+  "lang": "en-AU",
+  "icons": [
+    { "src": "/icons/app-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/app-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Inbox", "url": "/?view=inbox", "icons": [{ "src": "/icons/app-192.png", "sizes": "192x192" }] }
+  ]
+}
